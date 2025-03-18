@@ -2,8 +2,10 @@ import subprocess
 import time
 import numpy as np
 import pyaudio
+import os
 from pydub import AudioSegment
 from threading import Event, Thread
+from stem_splitter import StemSplitter
 
 class BluetoothDevice:
     def __init__(self, address, name):
@@ -30,16 +32,31 @@ class BluetoothDevice:
             print(f"Error disconnecting from {self.name}: {e}")
 
 class AudioManager:
-    def __init__(self, audio_file):
+    def __init__(self, audio_file, use_stems=False, stem_config=None):
         self.audio_file = audio_file
-        self.audio = AudioSegment.from_mp3(audio_file)
-        
-        if self.audio.channels != 2:
-            raise ValueError("Audio file must be stereo")
+        self.use_stems = use_stems
+        self.stem_splitter = None
+        self.stem_config = stem_config or {'left': ['vocals', 'other'], 'right': ['drums', 'bass']}
         
         # Apply a slight delay to compensate for Bluetooth latency differences
         # This is configurable and may need adjustment based on your specific devices
         self.sync_offset_ms = 0  # Start with no offset, adjust as needed
+        
+        if use_stems:
+            self._load_stems()
+        else:
+            self._load_stereo()
+            
+        self.pa = pyaudio.PyAudio()
+        self.streams = {}
+        self.buffer_size = 1024  # Smaller buffer size for better sync
+    
+    def _load_stereo(self):
+        """Load a stereo audio file and split into left and right channels"""
+        self.audio = AudioSegment.from_mp3(self.audio_file)
+        
+        if self.audio.channels != 2:
+            raise ValueError("Audio file must be stereo")
         
         # Split into separate channels
         self.left_audio = self.audio.split_to_mono()[0]
@@ -69,9 +86,42 @@ class AudioManager:
         self.right_channel = self.right_channel / (1 << (8 * self.audio.sample_width - 1))
         
         self.sample_rate = self.audio.frame_rate
-        self.pa = pyaudio.PyAudio()
-        self.streams = {}
-        self.buffer_size = 1024  # Smaller buffer size for better sync
+    
+    def _load_stems(self):
+        """Separate audio into stems and combine them according to configuration"""
+        print("Separating audio into stems (this may take a while)...")
+        
+        # Create a stem splitter with 4 stems (vocals, drums, bass, other)
+        self.stem_splitter = StemSplitter(num_stems=4)
+        
+        # Separate the audio file into stems
+        stems = self.stem_splitter.separate(self.audio_file)
+        
+        # Combine stems for left and right channels according to configuration
+        self.left_channel, self.sample_rate = self.stem_splitter.combine_stems(self.stem_config['left'])
+        self.right_channel, _ = self.stem_splitter.combine_stems(self.stem_config['right'])
+        
+        # Apply any sync offset if needed
+        if self.sync_offset_ms > 0:
+            # Add silence to the beginning of the left channel
+            silence_samples = np.zeros(int(self.sync_offset_ms * self.sample_rate / 1000))
+            self.left_channel = np.concatenate([silence_samples, self.left_channel])
+        elif self.sync_offset_ms < 0:
+            # Add silence to the beginning of the right channel
+            silence_samples = np.zeros(int(-self.sync_offset_ms * self.sample_rate / 1000))
+            self.right_channel = np.concatenate([silence_samples, self.right_channel])
+        
+        # Make sure both channels are the same length
+        max_length = max(len(self.left_channel), len(self.right_channel))
+        if len(self.left_channel) < max_length:
+            self.left_channel = np.pad(self.left_channel, (0, max_length - len(self.left_channel)))
+        if len(self.right_channel) < max_length:
+            self.right_channel = np.pad(self.right_channel, (0, max_length - len(self.right_channel)))
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if self.stem_splitter:
+            self.stem_splitter.cleanup()
         
     def list_audio_devices(self):
         devices = []
@@ -151,20 +201,27 @@ def get_audio_device_by_name(pa, name):
             return device_info
     return None
 
-def main(audio_file_path, sync_offset_ms=0):
+def main(audio_file_path, sync_offset_ms=0, use_stems=False, stem_config=None):
     print("\n=== Bluetooth Audio Stem Splitter ===")
     
     # Initialize audio manager
     print("\nStep 1: Loading audio file...")
     try:
-        audio_manager = AudioManager(audio_file_path)
+        # Create audio manager with stem separation if requested
+        audio_manager = AudioManager(audio_file_path, use_stems=use_stems, stem_config=stem_config)
+        
         # Apply any sync offset specified
         audio_manager.sync_offset_ms = sync_offset_ms
         if sync_offset_ms != 0:
             print(f"  - Applying sync offset of {sync_offset_ms}ms")
             # Reload audio with the new offset
-            audio_manager = AudioManager(audio_file_path)
+            audio_manager = AudioManager(audio_file_path, use_stems=use_stems, stem_config=stem_config)
             audio_manager.sync_offset_ms = sync_offset_ms
+        
+        if use_stems:
+            print(f"  - Using stem separation with configuration:")
+            print(f"    Left speaker: {', '.join(stem_config['left'])}")
+            print(f"    Right speaker: {', '.join(stem_config['right'])}")
             
         print(f"✓ Successfully loaded {audio_file_path}")
         print(f"  - Sample rate: {audio_manager.sample_rate} Hz")
@@ -281,9 +338,24 @@ if __name__ == "__main__":
     parser.add_argument('audio_file', help='Path to the stereo audio file (MP3)')
     parser.add_argument('--sync-offset', type=int, default=0, 
                         help='Sync offset in milliseconds. Positive values delay left channel, negative values delay right channel')
+    parser.add_argument('--use-stems', action='store_true', 
+                        help='Use stem separation to split audio into different components')
+    parser.add_argument('--left-stems', type=str, default='vocals,other',
+                        help='Comma-separated list of stems to play on left speaker (vocals,drums,bass,other)')
+    parser.add_argument('--right-stems', type=str, default='drums,bass',
+                        help='Comma-separated list of stems to play on right speaker (vocals,drums,bass,other)')
     
     args = parser.parse_args()
-    main(args.audio_file, args.sync_offset)
+    
+    # Parse stem configuration if using stems
+    stem_config = None
+    if args.use_stems:
+        stem_config = {
+            'left': args.left_stems.split(','),
+            'right': args.right_stems.split(',')
+        }
+    
+    main(args.audio_file, args.sync_offset, args.use_stems, stem_config)
 
 
 
